@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
-import pandas as pd
+import csv
 import requests
 import os
 import time
@@ -97,83 +97,82 @@ def grade_exam():
 
         encodings = ['utf-8', 'utf-8-sig', 'cp1251', 'latin1']
         delimiters = [',', ';', '\t']
-        df = None
+        data = None
+        headers = None
 
         for encoding in encodings:
             for delimiter in delimiters:
                 try:
-                    df = pd.read_csv(upload_path, encoding=encoding, delimiter=delimiter, on_bad_lines='skip')
-                    if df.shape[1] >= 7:
-                        break
+                    with open(upload_path, 'r', encoding=encoding) as f:
+                        reader = csv.reader(f, delimiter=delimiter)
+                        rows = list(reader)
+                        if len(rows) > 0 and len(rows[0]) >= 7:
+                            headers = rows[0]
+                            data = rows[1:]
+                            break
                 except:
                     continue
-            if df is not None and df.shape[1] >= 7:
+            if data is not None:
                 break
 
-        if df is None:
+        if data is None or headers is None:
             return jsonify({'error': 'Не удалось прочитать CSV файл. Проверьте формат и кодировку.'}), 400
 
-        if df.empty:
+        if len(data) == 0:
             return jsonify({'error': 'CSV файл пустой'}), 400
 
-        if df.shape[1] < 7:
-            return jsonify({'error': f'CSV должен содержать минимум 7 колонок (A-G), найдено: {df.shape[1]}'}), 400
+        if len(headers) < 7:
+            return jsonify({'error': f'CSV должен содержать минимум 7 колонок (A-G), найдено: {len(headers)}'}), 400
 
-        question_col = df.columns[2]
-        text_col = df.columns[6]
-        grade_col = df.columns[5]
+        question_col_idx = 2
+        text_col_idx = 6
+        grade_col_idx = 5
 
-        if question_col not in df.columns:
-            return jsonify({'error': f'Колонка C (вопрос) не найдена'}), 400
-        if text_col not in df.columns:
-            return jsonify({'error': f'Колонка G (текст) не найдена'}), 400
-
-        df[grade_col] = None
-
-        total_records = len(df)
+        total_records = len(data)
         processed_count = 0
         error_count = 0
         scores = []
         start_time = time.time()
 
-        for idx, row in df.iterrows():
-            try:
-                question_num = row[question_col]
+        for idx, row in enumerate(data):
+            while len(row) < 7:
+                row.append('')
 
-                if pd.isna(question_num):
-                    df.at[idx, grade_col] = 'ERROR: Номер вопроса отсутствует'
+            try:
+                question_num = row[question_col_idx].strip()
+
+                if not question_num:
+                    row[grade_col_idx] = 'ERROR: Номер вопроса отсутствует'
                     error_count += 1
                     continue
 
                 try:
                     question_num = int(question_num)
                 except (ValueError, TypeError):
-                    df.at[idx, grade_col] = f'ERROR: Некорректный номер вопроса ({question_num})'
+                    row[grade_col_idx] = f'ERROR: Некорректный номер вопроса ({question_num})'
                     error_count += 1
                     continue
 
                 if question_num not in [1, 2, 3, 4]:
-                    df.at[idx, grade_col] = f'ERROR: Номер вопроса должен быть 1-4 (получено: {question_num})'
+                    row[grade_col_idx] = f'ERROR: Номер вопроса должен быть 1-4 (получено: {question_num})'
                     error_count += 1
                     continue
 
-                text = row[text_col]
+                text = row[text_col_idx].strip()
 
-                if pd.isna(text) or str(text).strip() == '':
-                    df.at[idx, grade_col] = 'ERROR: Текст ответа отсутствует'
+                if not text:
+                    row[grade_col_idx] = 'ERROR: Текст ответа отсутствует'
                     error_count += 1
                     continue
-
-                text = str(text).strip()
 
                 model_uri = MODEL_URIS.get(question_num)
                 if not model_uri:
-                    df.at[idx, grade_col] = f'ERROR: Model URI не настроен для вопроса {question_num}'
+                    row[grade_col_idx] = f'ERROR: Model URI не настроен для вопроса {question_num}'
                     error_count += 1
                     continue
 
                 grade = call_yandex_gpt(model_uri, text)
-                df.at[idx, grade_col] = grade
+                row[grade_col_idx] = grade
 
                 try:
                     scores.append(float(grade))
@@ -183,7 +182,7 @@ def grade_exam():
                 processed_count += 1
 
             except Exception as e:
-                df.at[idx, grade_col] = f'ERROR: {str(e)}'
+                row[grade_col_idx] = f'ERROR: {str(e)}'
                 error_count += 1
 
         processing_time = round(time.time() - start_time, 2)
@@ -191,7 +190,10 @@ def grade_exam():
         output_filename = f"graded_{timestamp}_{original_filename}"
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
 
-        df.to_csv(output_path, index=False, encoding='utf-8-sig', sep=';')
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(headers)
+            writer.writerows(data)
 
         avg_score = round(sum(scores) / len(scores), 2) if scores else 0
 
