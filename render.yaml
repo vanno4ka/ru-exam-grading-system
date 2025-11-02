@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: exam-grading-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: YANDEX_API_KEY
+        sync: false
+      - key: MODEL_URI_Q1
+        sync: false
+      - key: MODEL_URI_Q2
+        sync: false
+      - key: MODEL_URI_Q3
+        sync: false
+      - key: MODEL_URI_Q4
+        sync: false
+    rootDir: backend
+
+  - type: web
+    name: exam-grading-frontend
+    runtime: static
+    buildCommand: npm install && npm run build
+    staticPublishPath: build
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://ru-exam-grading.onrender.com
+    rootDir: frontend
