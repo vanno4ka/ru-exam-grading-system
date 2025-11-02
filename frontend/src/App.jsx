@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Upload, Download, FileText, AlertCircle, CheckCircle, Info, XCircle } from 'lucide-react';
 
-const API_URL = 'http://localhost:5000';
+const API_URL = 'https://ru-exam-grading-system.onrender.com';
 
 const ExamGradingApp = () => {
   const [file, setFile] = useState(null);
