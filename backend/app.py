@@ -14,7 +14,7 @@ app = Flask(__name__)
 
 CORS(app, origins=[
     'http://localhost:3000',
-    'https://ru-exam-grading-system.onrender.com/'
+    'https://ru-exam-grading.onrender.com/'
 ])
 
 UPLOAD_FOLDER = 'uploads'
