@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Upload, Download, FileText, AlertCircle, CheckCircle, Info, XCircle } from 'lucide-react';
 
 const API_URL = 'https://ru-exam-grading-system.onrender.com';
+const BATCH_SIZE = 10;
 
 const ExamGradingApp = () => {
   const [file, setFile] = useState(null);
@@ -9,6 +10,7 @@ const ExamGradingApp = () => {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [processingStatus, setProcessingStatus] = useState('');
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
@@ -29,6 +31,7 @@ const ExamGradingApp = () => {
       setError(null);
       setResult(null);
       setUploadProgress(0);
+      setProcessingStatus('');
     }
   };
 
@@ -41,32 +44,86 @@ const ExamGradingApp = () => {
     setProcessing(true);
     setError(null);
     setResult(null);
-    setUploadProgress(10);
+    setUploadProgress(0);
+    setProcessingStatus('Загрузка файла...');
 
     const formData = new FormData();
     formData.append('file', file);
 
     try {
-      setUploadProgress(30);
-
-      const response = await fetch(`${API_URL}/api/grade`, {
+      const initResponse = await fetch(`${API_URL}/api/grade-init`, {
         method: 'POST',
         body: formData,
       });
 
-      setUploadProgress(60);
-
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Неизвестная ошибка сервера' }));
-        throw new Error(errorData.error || `Ошибка HTTP: ${response.status}`);
+      if (!initResponse.ok) {
+        const errorData = await initResponse.json().catch(() => ({ error: 'Ошибка инициализации' }));
+        throw new Error(errorData.error || `Ошибка HTTP: ${initResponse.status}`);
       }
 
-      const data = await response.json();
-      setUploadProgress(100);
-      setResult(data);
+      const initData = await initResponse.json();
+      const { sessionId, totalRecords } = initData;
 
-      if (data.errorCount > 0) {
-        setError(`Внимание: ${data.errorCount} записей обработано с ошибками. Проверьте результирующий файл.`);
+      setProcessingStatus(`Обработка ${totalRecords} записей...`);
+
+      let currentBatch = 0;
+      let totalProcessed = 0;
+      let totalErrors = 0;
+
+      while (currentBatch < totalRecords) {
+        const batchResponse = await fetch(`${API_URL}/api/grade-batch`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            sessionId: sessionId,
+            batchStart: currentBatch,
+            batchSize: BATCH_SIZE
+          }),
+        });
+
+        if (!batchResponse.ok) {
+          const errorData = await batchResponse.json().catch(() => ({ error: 'Ошибка обработки батча' }));
+          throw new Error(errorData.error || `Ошибка HTTP: ${batchResponse.status}`);
+        }
+
+        const batchData = await batchResponse.json();
+
+        totalProcessed += batchData.processedInBatch;
+        totalErrors += batchData.errorsInBatch;
+        currentBatch = batchData.batchEnd;
+
+        const progress = Math.round((currentBatch / totalRecords) * 100);
+        setUploadProgress(progress);
+        setProcessingStatus(`Обработано ${currentBatch} из ${totalRecords} записей...`);
+
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      setProcessingStatus('Завершение обработки...');
+
+      const finalizeResponse = await fetch(`${API_URL}/api/grade-finalize`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sessionId }),
+      });
+
+      if (!finalizeResponse.ok) {
+        const errorData = await finalizeResponse.json().catch(() => ({ error: 'Ошибка финализации' }));
+        throw new Error(errorData.error || `Ошибка HTTP: ${finalizeResponse.status}`);
+      }
+
+      const finalData = await finalizeResponse.json();
+
+      setUploadProgress(100);
+      setResult(finalData);
+      setProcessingStatus('');
+
+      if (finalData.errorCount > 0) {
+        setError(`Внимание: ${finalData.errorCount} записей обработано с ошибками. Проверьте результирующий файл.`);
       }
 
     } catch (err) {
@@ -78,9 +135,9 @@ const ExamGradingApp = () => {
         setError(err.message || 'Произошла ошибка при обработке файла');
       }
       setResult(null);
+      setProcessingStatus('');
     } finally {
       setProcessing(false);
-      setUploadProgress(0);
     }
   };
 
@@ -118,6 +175,7 @@ const ExamGradingApp = () => {
     setResult(null);
     setError(null);
     setUploadProgress(0);
+    setProcessingStatus('');
   };
 
   return (
@@ -171,10 +229,10 @@ const ExamGradingApp = () => {
               </div>
           )}
 
-          {processing && uploadProgress > 0 && (
+          {processing && (
               <div className="mt-4">
                 <div className="flex justify-between text-sm text-gray-600 mb-2">
-                  <span>Обработка...</span>
+                  <span>{processingStatus || 'Обработка...'}</span>
                   <span>{uploadProgress}%</span>
                 </div>
                 <div className="w-full bg-gray-200 rounded-full h-2">
@@ -183,6 +241,9 @@ const ExamGradingApp = () => {
                       style={{width: `${uploadProgress}%`}}
                   />
                 </div>
+                <p className="text-xs text-gray-500 mt-2 text-center">
+                  Файл обрабатывается по {BATCH_SIZE} строк за раз. Пожалуйста, подождите...
+                </p>
               </div>
           )}
 
@@ -219,11 +280,7 @@ const ExamGradingApp = () => {
                     {result.errorCount}
                   </div>
                 </div>
-                <div className="bg-gray-50 p-4 rounded-lg">
-                  <div className="text-sm text-gray-600 mb-1">Время обработки</div>
-                  <div className="text-2xl font-bold text-gray-800">{result.processingTime}</div>
-                </div>
-                <div className="bg-gray-50 p-4 rounded-lg">
+                <div className="bg-gray-50 p-4 rounded-lg sm:col-span-2">
                   <div className="text-sm text-gray-600 mb-1">Файл результата</div>
                   <div className="text-sm font-semibold text-gray-800 truncate">{result.filename}</div>
                 </div>

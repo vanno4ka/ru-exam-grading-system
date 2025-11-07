@@ -80,8 +80,8 @@ def call_yandex_gpt(model_uri, text):
         raise Exception(f"Ошибка при вызове YandexGPT: {str(e)}")
 
 
-@app.route('/api/grade', methods=['POST'])
-def grade_exam():
+@app.route('/api/grade-init', methods=['POST'])
+def grade_init():
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'Файл не предоставлен'}), 400
@@ -128,17 +128,60 @@ def grade_exam():
         if len(headers) < 7:
             return jsonify({'error': f'CSV должен содержать минимум 7 колонок (A-G), найдено: {len(headers)}'}), 400
 
+        session_id = f"{timestamp}_{original_filename}"
+        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
+
+        with open(session_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(headers)
+            writer.writerows(data)
+
+        return jsonify({
+            'sessionId': session_id,
+            'totalRecords': len(data),
+            'filename': original_filename
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"Ошибка инициализации: {traceback.format_exc()}")
+        return jsonify({'error': f'Ошибка: {str(e)}'}), 500
+
+
+@app.route('/api/grade-batch', methods=['POST'])
+def grade_batch():
+    try:
+        data = request.json
+        session_id = data.get('sessionId')
+        batch_start = data.get('batchStart', 0)
+        batch_size = data.get('batchSize', 10)
+
+        if not session_id:
+            return jsonify({'error': 'Session ID не предоставлен'}), 400
+
+        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
+
+        if not os.path.exists(session_path):
+            return jsonify({'error': 'Сессия не найдена'}), 404
+
+        # Читаем данные
+        with open(session_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, delimiter=';')
+            headers = next(reader)
+            all_rows = list(reader)
+
+        total_records = len(all_rows)
+        batch_end = min(batch_start + batch_size, total_records)
+        batch_rows = all_rows[batch_start:batch_end]
+
         question_col_idx = 2
         text_col_idx = 6
         grade_col_idx = 5
 
-        total_records = len(data)
         processed_count = 0
         error_count = 0
         scores = []
-        start_time = time.time()
 
-        for idx, row in enumerate(data):
+        for row in batch_rows:
             while len(row) < 7:
                 row.append('')
 
@@ -189,32 +232,95 @@ def grade_exam():
                 row[grade_col_idx] = f'ERROR: {str(e)}'
                 error_count += 1
 
-        processing_time = round(time.time() - start_time, 2)
+        # Обновляем обработанные строки в файле
+        all_rows[batch_start:batch_end] = batch_rows
 
-        output_filename = f"graded_{timestamp}_{original_filename}"
+        with open(session_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(headers)
+            writer.writerows(all_rows)
+
+        return jsonify({
+            'processedInBatch': processed_count,
+            'errorsInBatch': error_count,
+            'batchStart': batch_start,
+            'batchEnd': batch_end,
+            'totalRecords': total_records,
+            'completed': batch_end >= total_records
+        }), 200
+
+    except Exception as e:
+        app.logger.error(f"Ошибка обработки батча: {traceback.format_exc()}")
+        return jsonify({'error': f'Ошибка: {str(e)}'}), 500
+
+
+@app.route('/api/grade-finalize', methods=['POST'])
+def grade_finalize():
+    try:
+        data = request.json
+        session_id = data.get('sessionId')
+
+        if not session_id:
+            return jsonify({'error': 'Session ID не предоставлен'}), 400
+
+        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
+
+        if not os.path.exists(session_path):
+            return jsonify({'error': 'Сессия не найдена'}), 404
+
+        with open(session_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, delimiter=';')
+            headers = next(reader)
+            all_rows = list(reader)
+
+        grade_col_idx = 5
+
+        total_records = len(all_rows)
+        processed_count = 0
+        error_count = 0
+        scores = []
+
+        for row in all_rows:
+            if len(row) > grade_col_idx:
+                grade_value = row[grade_col_idx]
+                if grade_value and not grade_value.startswith('ERROR'):
+                    processed_count += 1
+                    try:
+                        scores.append(float(grade_value))
+                    except:
+                        pass
+                elif grade_value.startswith('ERROR'):
+                    error_count += 1
+
+        output_filename = f"graded_{session_id}"
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
 
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f, delimiter=';')
             writer.writerow(headers)
-            writer.writerows(data)
+            writer.writerows(all_rows)
+
+        try:
+            os.remove(session_path)
+            upload_path = os.path.join(UPLOAD_FOLDER, session_id)
+            if os.path.exists(upload_path):
+                os.remove(upload_path)
+        except:
+            pass
 
         avg_score = round(sum(scores) / len(scores), 2) if scores else 0
 
-        result = {
+        return jsonify({
             'filename': output_filename,
             'recordsProcessed': processed_count,
             'totalRecords': total_records,
             'errorCount': error_count,
-            'avgScore': avg_score,
-            'processingTime': f'{processing_time}s'
-        }
-
-        return jsonify(result), 200
+            'avgScore': avg_score
+        }), 200
 
     except Exception as e:
-        app.logger.error(f"Критическая ошибка: {traceback.format_exc()}")
-        return jsonify({'error': f'Критическая ошибка сервера: {str(e)}'}), 500
+        app.logger.error(f"Ошибка финализации: {traceback.format_exc()}")
+        return jsonify({'error': f'Ошибка: {str(e)}'}), 500
 
 
 @app.route('/api/download/<filename>', methods=['GET'])
