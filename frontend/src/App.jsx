@@ -64,7 +64,8 @@ const ExamGradingApp = () => {
       const initData = await initResponse.json();
       const { sessionId, totalRecords } = initData;
 
-      setProcessingStatus(`Обработка ${totalRecords} записей...`);
+      const estimatedMinutes = Math.ceil((totalRecords * 1.1) / 60);
+      setProcessingStatus(`Обработка ${totalRecords} записей (примерно ${estimatedMinutes} мин)...`);
 
       let currentBatch = 0;
       let totalProcessed = 0;
@@ -241,9 +242,6 @@ const ExamGradingApp = () => {
                       style={{width: `${uploadProgress}%`}}
                   />
                 </div>
-                <p className="text-xs text-gray-500 mt-2 text-center">
-                  Файл обрабатывается по {BATCH_SIZE} строк за раз. Пожалуйста, подождите...
-                </p>
               </div>
           )}
 

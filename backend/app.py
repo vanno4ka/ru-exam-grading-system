@@ -33,7 +33,7 @@ MODEL_URIS = {
 }
 
 
-def call_yandex_gpt(model_uri, text):
+def call_yandex_gpt(model_uri, text, max_retries=3):
     if not YANDEX_API_KEY:
         raise ValueError("YANDEX_API_KEY не настроен")
 
@@ -50,34 +50,40 @@ def call_yandex_gpt(model_uri, text):
         "text": text
     }
 
-    try:
-        response = requests.post(YANDEX_API_URL, json=payload, headers=headers, timeout=30)
-        response.raise_for_status()
-        result = response.json()
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(YANDEX_API_URL, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            result = response.json()
 
-        if 'predictions' in result and len(result['predictions']) > 0:
-            max_prediction = max(result['predictions'], key=lambda x: x.get('confidence', 0))
-            label = max_prediction.get('label', 'ERROR')
+            if 'predictions' in result and len(result['predictions']) > 0:
+                max_prediction = max(result['predictions'], key=lambda x: x.get('confidence', 0))
+                label = max_prediction.get('label', 'ERROR')
 
-            if label == 'grade-0':
-                return '0'
-            elif label == 'grade-1':
-                return '1'
-            elif label == 'grade-2':
-                return '2'
+                if label == 'grade-0':
+                    return '0'
+                elif label == 'grade-1':
+                    return '1'
+                elif label == 'grade-2':
+                    return '2'
+                else:
+                    return label
             else:
-                return label
-        else:
-            return 'ERROR'
+                return 'ERROR'
 
-    except requests.exceptions.Timeout:
-        raise Exception("Таймаут при обращении к YandexGPT API")
-    except requests.exceptions.ConnectionError:
-        raise Exception("Ошибка подключения к YandexGPT API")
-    except requests.exceptions.HTTPError as e:
-        raise Exception(f"HTTP ошибка {e.response.status_code}: {e.response.text}")
-    except Exception as e:
-        raise Exception(f"Ошибка при вызове YandexGPT: {str(e)}")
+        except requests.exceptions.Timeout:
+            raise Exception("Таймаут при обращении к YandexGPT API")
+        except requests.exceptions.ConnectionError:
+            raise Exception("Ошибка подключения к YandexGPT API")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 429:
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                    continue
+                raise Exception("Превышен лимит запросов к API. Повторите попытку через минуту.")
+            raise Exception(f"HTTP ошибка {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise Exception(f"Ошибка при вызове YandexGPT: {str(e)}")
 
 
 @app.route('/api/grade-init', methods=['POST'])
@@ -228,11 +234,12 @@ def grade_batch():
 
                 processed_count += 1
 
+                time.sleep(1.1)
+
             except Exception as e:
                 row[grade_col_idx] = f'ERROR: {str(e)}'
                 error_count += 1
 
-        # Обновляем обработанные строки в файле
         all_rows[batch_start:batch_end] = batch_rows
 
         with open(session_path, 'w', encoding='utf-8-sig', newline='') as f:
