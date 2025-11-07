@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Upload, Download, FileText, AlertCircle, CheckCircle, Info, XCircle } from 'lucide-react';
 
 const API_URL = 'https://ru-exam-grading-system.onrender.com';
-const BATCH_SIZE = 10;
+const POLLING_INTERVAL = 3000;
 
 const ExamGradingApp = () => {
   const [file, setFile] = useState(null);
@@ -11,6 +11,16 @@ const ExamGradingApp = () => {
   const [error, setError] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [processingStatus, setProcessingStatus] = useState('');
+
+  const pollingTimerId = useRef(null);
+
+  useEffect(() => {
+    return () => {
+      if (pollingTimerId.current) {
+        clearTimeout(pollingTimerId.current);
+      }
+    };
+  }, []);
 
   const handleFileChange = (e) => {
     const selectedFile = e.target.files[0];
@@ -31,6 +41,58 @@ const ExamGradingApp = () => {
       setError(null);
       setResult(null);
       setUploadProgress(0);
+      setProcessingStatus('');
+    }
+  };
+
+  const pollStatus = async (sessionId) => {
+    try {
+      const statusResponse = await fetch(`${API_URL}/api/status/${sessionId}`);
+
+      if (!statusResponse.ok) {
+        const errorData = await statusResponse.json().catch(() => ({ error: 'Ошибка получения статуса' }));
+        throw new Error(errorData.error || `Ошибка HTTP: ${statusResponse.status}`);
+      }
+
+      const statusData = await statusResponse.json();
+
+      switch (statusData.status) {
+        case 'completed':
+          setUploadProgress(100);
+          setResult(statusData);
+          setProcessingStatus('Обработка завершена!');
+          setProcessing(false);
+
+          if (statusData.errorCount > 0) {
+            setError(`Внимание: ${statusData.errorCount} записей обработано с ошибками. Проверьте результирующий файл.`);
+          }
+          break;
+
+        case 'failed':
+          throw new Error(statusData.error_message || 'Фоновая задача завершилась с ошибкой');
+
+        case 'running':
+        case 'pending':
+        default:
+          const progress = statusData.total > 0
+            ? Math.round((statusData.progress / statusData.total) * 100)
+            : 0;
+          setUploadProgress(progress);
+          setProcessingStatus(`Обработано ${statusData.progress} из ${statusData.total} записей...`);
+
+          if (statusData.errors > 0) {
+             setError(`Внимание: ${statusData.errors} ошибок при обработке.`);
+          } else {
+             setError(null);
+          }
+
+          pollingTimerId.current = setTimeout(() => pollStatus(sessionId), POLLING_INTERVAL);
+          break;
+      }
+
+    } catch (err) {
+      setError(err.message || 'Произошла ошибка при опросе статуса');
+      setProcessing(false);
       setProcessingStatus('');
     }
   };
@@ -67,65 +129,7 @@ const ExamGradingApp = () => {
       const estimatedMinutes = Math.ceil((totalRecords * 1.1) / 60);
       setProcessingStatus(`Обработка ${totalRecords} записей (примерно ${estimatedMinutes} мин)...`);
 
-      let currentBatch = 0;
-      let totalProcessed = 0;
-      let totalErrors = 0;
-
-      while (currentBatch < totalRecords) {
-        const batchResponse = await fetch(`${API_URL}/api/grade-batch`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            sessionId: sessionId,
-            batchStart: currentBatch,
-            batchSize: BATCH_SIZE
-          }),
-        });
-
-        if (!batchResponse.ok) {
-          const errorData = await batchResponse.json().catch(() => ({ error: 'Ошибка обработки батча' }));
-          throw new Error(errorData.error || `Ошибка HTTP: ${batchResponse.status}`);
-        }
-
-        const batchData = await batchResponse.json();
-
-        totalProcessed += batchData.processedInBatch;
-        totalErrors += batchData.errorsInBatch;
-        currentBatch = batchData.batchEnd;
-
-        const progress = Math.round((currentBatch / totalRecords) * 100);
-        setUploadProgress(progress);
-        setProcessingStatus(`Обработано ${currentBatch} из ${totalRecords} записей...`);
-
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-
-      setProcessingStatus('Завершение обработки...');
-
-      const finalizeResponse = await fetch(`${API_URL}/api/grade-finalize`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ sessionId }),
-      });
-
-      if (!finalizeResponse.ok) {
-        const errorData = await finalizeResponse.json().catch(() => ({ error: 'Ошибка финализации' }));
-        throw new Error(errorData.error || `Ошибка HTTP: ${finalizeResponse.status}`);
-      }
-
-      const finalData = await finalizeResponse.json();
-
-      setUploadProgress(100);
-      setResult(finalData);
-      setProcessingStatus('');
-
-      if (finalData.errorCount > 0) {
-        setError(`Внимание: ${finalData.errorCount} записей обработано с ошибками. Проверьте результирующий файл.`);
-      }
+      pollingTimerId.current = setTimeout(() => pollStatus(sessionId), POLLING_INTERVAL);
 
     } catch (err) {
       if (err.name === 'TypeError' && err.message === 'Failed to fetch') {
@@ -137,19 +141,19 @@ const ExamGradingApp = () => {
       }
       setResult(null);
       setProcessingStatus('');
-    } finally {
       setProcessing(false);
     }
   };
 
   const downloadResult = async () => {
-    if (!result || !result.filename) {
+
+    if (!result || !result.result_file) {
       setError('Нет доступного файла для скачивания');
       return;
     }
 
     try {
-      const response = await fetch(`${API_URL}/api/download/${result.filename}`);
+      const response = await fetch(`${API_URL}/api/download/${result.result_file}`);
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({ error: 'Файл не найден' }));
@@ -160,7 +164,7 @@ const ExamGradingApp = () => {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = result.filename;
+      a.download = result.result_file;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -177,11 +181,18 @@ const ExamGradingApp = () => {
     setError(null);
     setUploadProgress(0);
     setProcessingStatus('');
+
+    if (pollingTimerId.current) {
+      clearTimeout(pollingTimerId.current);
+      pollingTimerId.current = null;
+    }
+    setProcessing(false);
   };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4 sm:p-8">
       <div className="max-w-4xl mx-auto">
+        {/* ... (блок заголовка без изменений) ... */}
         <div className="bg-white rounded-lg shadow-lg p-6 sm:p-8 mb-6">
           <h1 className="text-2xl sm:text-3xl font-bold text-gray-800 mb-2">
             Автоматическая оценка экзамена по русскому языку
@@ -280,7 +291,7 @@ const ExamGradingApp = () => {
                 </div>
                 <div className="bg-gray-50 p-4 rounded-lg sm:col-span-2">
                   <div className="text-sm text-gray-600 mb-1">Файл результата</div>
-                  <div className="text-sm font-semibold text-gray-800 truncate">{result.filename}</div>
+                  <div className="text-sm font-semibold text-gray-800 truncate">{result.result_file}</div>
                 </div>
               </div>
 

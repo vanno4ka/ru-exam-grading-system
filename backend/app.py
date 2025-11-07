@@ -7,6 +7,7 @@ import time
 from datetime import datetime
 import traceback
 from dotenv import load_dotenv
+import threading
 
 load_dotenv()
 
@@ -31,6 +32,9 @@ MODEL_URIS = {
     3: os.getenv('MODEL_URI_Q3', ''),
     4: os.getenv('MODEL_URI_Q4', '')
 }
+
+jobs = {}
+jobs_lock = threading.Lock()
 
 
 def call_yandex_gpt(model_uri, text, max_retries=3):
@@ -86,6 +90,104 @@ def call_yandex_gpt(model_uri, text, max_retries=3):
             raise Exception(f"Ошибка при вызове YandexGPT: {str(e)}")
 
 
+
+def process_csv_background(session_id, session_path, upload_path, total_records):
+
+    try:
+        with jobs_lock:
+            jobs[session_id]['status'] = 'running'
+
+        with open(session_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.reader(f, delimiter=';')
+            headers = next(reader)
+            all_rows = list(reader)
+
+        question_col_idx = 2
+        text_col_idx = 6
+        grade_col_idx = 5
+
+        processed_count = 0
+        error_count = 0
+        scores = []
+
+        for i, row in enumerate(all_rows):
+            while len(row) < 7:
+                row.append('')
+
+            try:
+                question_num = row[question_col_idx].strip()
+
+                if not question_num:
+                    raise ValueError("Номер вопроса отсутствует")
+
+                try:
+                    question_num = int(question_num)
+                except (ValueError, TypeError):
+                    raise ValueError(f"Некорректный номер вопроса ({question_num})")
+
+                if question_num not in [1, 2, 3, 4]:
+                    raise ValueError(f"Номер вопроса должен быть 1-4 (получено: {question_num})")
+
+                text = row[text_col_idx].strip()
+                if not text:
+                    raise ValueError("Текст ответа отсутствует")
+
+                model_uri = MODEL_URIS.get(question_num)
+                if not model_uri:
+                    raise ValueError(f"Model URI не настроен для вопроса {question_num}")
+
+                grade = call_yandex_gpt(model_uri, text)
+                row[grade_col_idx] = grade
+
+                try:
+                    scores.append(float(grade))
+                except (ValueError, TypeError):
+                    pass
+
+                processed_count += 1
+                time.sleep(1.1)
+
+            except Exception as e:
+                row[grade_col_idx] = f'ERROR: {str(e)}'
+                error_count += 1
+
+            with jobs_lock:
+                jobs[session_id]['progress'] = i + 1
+                jobs[session_id]['errors'] = error_count
+
+        output_filename = f"graded_{session_id}"
+        output_path = os.path.join(PROCESSED_FOLDER, output_filename)
+
+        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(headers)
+            writer.writerows(all_rows)
+
+        try:
+            os.remove(session_path)
+            if os.path.exists(upload_path):
+                os.remove(upload_path)
+        except:
+            app.logger.warning(f"Не удалось удалить временные файлы для {session_id}")
+            pass
+
+        avg_score = round(sum(scores) / len(scores), 2) if scores else 0
+
+        with jobs_lock:
+            jobs[session_id]['status'] = 'completed'
+            jobs[session_id]['result_file'] = output_filename
+            jobs[session_id]['recordsProcessed'] = processed_count
+            jobs[session_id]['totalRecords'] = total_records
+            jobs[session_id]['errorCount'] = error_count
+            jobs[session_id]['avgScore'] = avg_score
+
+    except Exception as e:
+        app.logger.error(f"Критическая ошибка в фоновом процессе {session_id}: {traceback.format_exc()}")
+        with jobs_lock:
+            jobs[session_id]['status'] = 'failed'
+            jobs[session_id]['error_message'] = str(e)
+
+
 @app.route('/api/grade-init', methods=['POST'])
 def grade_init():
     try:
@@ -134,6 +236,7 @@ def grade_init():
         if len(headers) < 7:
             return jsonify({'error': f'CSV должен содержать минимум 7 колонок (A-G), найдено: {len(headers)}'}), 400
 
+        total_records = len(data)
         session_id = f"{timestamp}_{original_filename}"
         session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
 
@@ -142,9 +245,26 @@ def grade_init():
             writer.writerow(headers)
             writer.writerows(data)
 
+        with jobs_lock:
+            jobs[session_id] = {
+                'status': 'pending',
+                'progress': 0,
+                'total': total_records,
+                'errors': 0,
+                'result_file': None,
+                'error_message': None
+            }
+
+        thread = threading.Thread(
+            target=process_csv_background,
+            args=(session_id, session_path, upload_path, total_records)
+        )
+        thread.daemon = True
+        thread.start()
+
         return jsonify({
             'sessionId': session_id,
-            'totalRecords': len(data),
+            'totalRecords': total_records,
             'filename': original_filename
         }), 200
 
@@ -153,182 +273,20 @@ def grade_init():
         return jsonify({'error': f'Ошибка: {str(e)}'}), 500
 
 
-@app.route('/api/grade-batch', methods=['POST'])
-def grade_batch():
-    try:
-        data = request.json
-        session_id = data.get('sessionId')
-        batch_start = data.get('batchStart', 0)
-        batch_size = data.get('batchSize', 10)
+@app.route('/api/status/<session_id>', methods=['GET'])
+def get_status(session_id):
 
-        if not session_id:
-            return jsonify({'error': 'Session ID не предоставлен'}), 400
+    with jobs_lock:
+        job_status = jobs.get(session_id, {}).copy()
 
-        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
+    if not job_status:
+        return jsonify({'error': 'Сессия не найдена'}), 404
 
-        if not os.path.exists(session_path):
-            return jsonify({'error': 'Сессия не найдена'}), 404
+    if job_status.get('status') in ['completed', 'failed']:
+        with jobs_lock:
+            jobs.pop(session_id, None)
 
-        # Читаем данные
-        with open(session_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.reader(f, delimiter=';')
-            headers = next(reader)
-            all_rows = list(reader)
-
-        total_records = len(all_rows)
-        batch_end = min(batch_start + batch_size, total_records)
-        batch_rows = all_rows[batch_start:batch_end]
-
-        question_col_idx = 2
-        text_col_idx = 6
-        grade_col_idx = 5
-
-        processed_count = 0
-        error_count = 0
-        scores = []
-
-        for row in batch_rows:
-            while len(row) < 7:
-                row.append('')
-
-            try:
-                question_num = row[question_col_idx].strip()
-
-                if not question_num:
-                    row[grade_col_idx] = 'ERROR: Номер вопроса отсутствует'
-                    error_count += 1
-                    continue
-
-                try:
-                    question_num = int(question_num)
-                except (ValueError, TypeError):
-                    row[grade_col_idx] = f'ERROR: Некорректный номер вопроса ({question_num})'
-                    error_count += 1
-                    continue
-
-                if question_num not in [1, 2, 3, 4]:
-                    row[grade_col_idx] = f'ERROR: Номер вопроса должен быть 1-4 (получено: {question_num})'
-                    error_count += 1
-                    continue
-
-                text = row[text_col_idx].strip()
-
-                if not text:
-                    row[grade_col_idx] = 'ERROR: Текст ответа отсутствует'
-                    error_count += 1
-                    continue
-
-                model_uri = MODEL_URIS.get(question_num)
-                if not model_uri:
-                    row[grade_col_idx] = f'ERROR: Model URI не настроен для вопроса {question_num}'
-                    error_count += 1
-                    continue
-
-                grade = call_yandex_gpt(model_uri, text)
-                row[grade_col_idx] = grade
-
-                try:
-                    scores.append(float(grade))
-                except (ValueError, TypeError):
-                    pass
-
-                processed_count += 1
-
-                time.sleep(1.1)
-
-            except Exception as e:
-                row[grade_col_idx] = f'ERROR: {str(e)}'
-                error_count += 1
-
-        all_rows[batch_start:batch_end] = batch_rows
-
-        with open(session_path, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.writer(f, delimiter=';')
-            writer.writerow(headers)
-            writer.writerows(all_rows)
-
-        return jsonify({
-            'processedInBatch': processed_count,
-            'errorsInBatch': error_count,
-            'batchStart': batch_start,
-            'batchEnd': batch_end,
-            'totalRecords': total_records,
-            'completed': batch_end >= total_records
-        }), 200
-
-    except Exception as e:
-        app.logger.error(f"Ошибка обработки батча: {traceback.format_exc()}")
-        return jsonify({'error': f'Ошибка: {str(e)}'}), 500
-
-
-@app.route('/api/grade-finalize', methods=['POST'])
-def grade_finalize():
-    try:
-        data = request.json
-        session_id = data.get('sessionId')
-
-        if not session_id:
-            return jsonify({'error': 'Session ID не предоставлен'}), 400
-
-        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
-
-        if not os.path.exists(session_path):
-            return jsonify({'error': 'Сессия не найдена'}), 404
-
-        with open(session_path, 'r', encoding='utf-8-sig') as f:
-            reader = csv.reader(f, delimiter=';')
-            headers = next(reader)
-            all_rows = list(reader)
-
-        grade_col_idx = 5
-
-        total_records = len(all_rows)
-        processed_count = 0
-        error_count = 0
-        scores = []
-
-        for row in all_rows:
-            if len(row) > grade_col_idx:
-                grade_value = row[grade_col_idx]
-                if grade_value and not grade_value.startswith('ERROR'):
-                    processed_count += 1
-                    try:
-                        scores.append(float(grade_value))
-                    except:
-                        pass
-                elif grade_value.startswith('ERROR'):
-                    error_count += 1
-
-        output_filename = f"graded_{session_id}"
-        output_path = os.path.join(PROCESSED_FOLDER, output_filename)
-
-        with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.writer(f, delimiter=';')
-            writer.writerow(headers)
-            writer.writerows(all_rows)
-
-        try:
-            os.remove(session_path)
-            upload_path = os.path.join(UPLOAD_FOLDER, session_id)
-            if os.path.exists(upload_path):
-                os.remove(upload_path)
-        except:
-            pass
-
-        avg_score = round(sum(scores) / len(scores), 2) if scores else 0
-
-        return jsonify({
-            'filename': output_filename,
-            'recordsProcessed': processed_count,
-            'totalRecords': total_records,
-            'errorCount': error_count,
-            'avgScore': avg_score
-        }), 200
-
-    except Exception as e:
-        app.logger.error(f"Ошибка финализации: {traceback.format_exc()}")
-        return jsonify({'error': f'Ошибка: {str(e)}'}), 500
-
+    return jsonify(job_status), 200
 
 @app.route('/api/download/<filename>', methods=['GET'])
 def download_file(filename):
