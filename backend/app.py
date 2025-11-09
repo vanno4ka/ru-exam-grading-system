@@ -156,6 +156,9 @@ def process_csv_background(session_id, session_path, upload_path, total_records)
                 jobs[session_id]['errors'] = error_count
 
         output_filename = f"graded_{session_id}"
+        if not output_filename.endswith('.csv'):
+            output_filename += '.csv'
+
         output_path = os.path.join(PROCESSED_FOLDER, output_filename)
 
         with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
@@ -282,16 +285,17 @@ def get_status(session_id):
     if not job_status:
         return jsonify({'error': 'Сессия не найдена'}), 404
 
-    if job_status.get('status') in ['completed', 'failed']:
-        with jobs_lock:
-            jobs.pop(session_id, None)
-
     return jsonify(job_status), 200
 
 @app.route('/api/download/<filename>', methods=['GET'])
 def download_file(filename):
     try:
         file_path = os.path.join(PROCESSED_FOLDER, filename)
+
+        app.logger.info(f"Попытка скачивания: {filename}")
+        app.logger.info(f"Полный путь: {file_path}")
+        app.logger.info(f"Файл существует: {os.path.exists(file_path)}")
+        app.logger.info(f"Файлы в директории: {os.listdir(PROCESSED_FOLDER)}")
 
         if not os.path.exists(file_path):
             return jsonify({'error': 'Файл не найден'}), 404
