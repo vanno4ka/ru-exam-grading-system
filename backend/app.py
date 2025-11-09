@@ -4,7 +4,7 @@ import csv
 import requests
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
 from dotenv import load_dotenv
 import threading
@@ -33,8 +33,50 @@ MODEL_URIS = {
     4: os.getenv('MODEL_URI_Q4', '')
 }
 
+JOB_TTL = 3600
+FILE_TTL = 7200
+
 jobs = {}
 jobs_lock = threading.Lock()
+
+
+def cleanup_old_jobs():
+    while True:
+        try:
+            time.sleep(300)
+
+            current_time = datetime.now()
+
+            with jobs_lock:
+                expired_sessions = []
+
+                for session_id, job_data in jobs.items():
+                    completed_at = job_data.get('completed_at')
+                    if completed_at and (current_time - completed_at).total_seconds() > JOB_TTL:
+                        expired_sessions.append(session_id)
+
+                for session_id in expired_sessions:
+                    app.logger.info(f"Удаление истекшей задачи: {session_id}")
+                    jobs.pop(session_id, None)
+
+            for folder in [UPLOAD_FOLDER, PROCESSED_FOLDER]:
+                if not os.path.exists(folder):
+                    continue
+
+                for filename in os.listdir(folder):
+                    file_path = os.path.join(folder, filename)
+
+                    try:
+                        file_age = (current_time - datetime.fromtimestamp(os.path.getmtime(file_path))).total_seconds()
+
+                        if file_age > FILE_TTL:
+                            os.remove(file_path)
+                            app.logger.info(f"Удален старый файл: {filename}")
+                    except Exception as e:
+                        app.logger.error(f"Ошибка при удалении файла {filename}: {str(e)}")
+
+        except Exception as e:
+            app.logger.error(f"Ошибка в cleanup_old_jobs: {traceback.format_exc()}")
 
 
 def call_yandex_gpt(model_uri, text, max_retries=3):
@@ -90,12 +132,11 @@ def call_yandex_gpt(model_uri, text, max_retries=3):
             raise Exception(f"Ошибка при вызове YandexGPT: {str(e)}")
 
 
-
 def process_csv_background(session_id, session_path, upload_path, total_records):
-
     try:
         with jobs_lock:
             jobs[session_id]['status'] = 'running'
+            jobs[session_id]['started_at'] = datetime.now()
 
         with open(session_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.reader(f, delimiter=';')
@@ -170,14 +211,14 @@ def process_csv_background(session_id, session_path, upload_path, total_records)
             os.remove(session_path)
             if os.path.exists(upload_path):
                 os.remove(upload_path)
-        except:
-            app.logger.warning(f"Не удалось удалить временные файлы для {session_id}")
-            pass
+        except Exception as e:
+            app.logger.warning(f"Не удалось удалить временные файлы для {session_id}: {str(e)}")
 
         avg_score = round(sum(scores) / len(scores), 2) if scores else 0
 
         with jobs_lock:
             jobs[session_id]['status'] = 'completed'
+            jobs[session_id]['completed_at'] = datetime.now()  # Добавляем время завершения
             jobs[session_id]['result_file'] = output_filename
             jobs[session_id]['recordsProcessed'] = processed_count
             jobs[session_id]['totalRecords'] = total_records
@@ -188,6 +229,7 @@ def process_csv_background(session_id, session_path, upload_path, total_records)
         app.logger.error(f"Критическая ошибка в фоновом процессе {session_id}: {traceback.format_exc()}")
         with jobs_lock:
             jobs[session_id]['status'] = 'failed'
+            jobs[session_id]['completed_at'] = datetime.now()
             jobs[session_id]['error_message'] = str(e)
 
 
@@ -241,7 +283,7 @@ def grade_init():
 
         total_records = len(data)
         session_id = f"{timestamp}_{original_filename}"
-        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}.csv")
+        session_path = os.path.join(UPLOAD_FOLDER, f"session_{session_id}")
 
         with open(session_path, 'w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f, delimiter=';')
@@ -255,7 +297,10 @@ def grade_init():
                 'total': total_records,
                 'errors': 0,
                 'result_file': None,
-                'error_message': None
+                'error_message': None,
+                'created_at': datetime.now(),
+                'completed_at': None,
+                'started_at': None
             }
 
         thread = threading.Thread(
@@ -278,14 +323,31 @@ def grade_init():
 
 @app.route('/api/status/<session_id>', methods=['GET'])
 def get_status(session_id):
-
     with jobs_lock:
-        job_status = jobs.get(session_id, {}).copy()
+        job_status = jobs.get(session_id)
 
-    if not job_status:
-        return jsonify({'error': 'Сессия не найдена'}), 404
+        if not job_status:
+            return jsonify({'error': 'Сессия не найдена'}), 404
 
-    return jsonify(job_status), 200
+        response_data = {
+            'status': job_status.get('status'),
+            'progress': job_status.get('progress'),
+            'total': job_status.get('total'),
+            'errors': job_status.get('errors'),
+            'result_file': job_status.get('result_file'),
+            'error_message': job_status.get('error_message'),
+            'recordsProcessed': job_status.get('recordsProcessed'),
+            'totalRecords': job_status.get('totalRecords'),
+            'errorCount': job_status.get('errorCount'),
+            'avgScore': job_status.get('avgScore')
+        }
+
+        if job_status.get('completed_at'):
+            time_remaining = JOB_TTL - (datetime.now() - job_status['completed_at']).total_seconds()
+            response_data['ttl_seconds'] = max(0, int(time_remaining))
+
+    return jsonify(response_data), 200
+
 
 @app.route('/api/download/<filename>', methods=['GET'])
 def download_file(filename):
@@ -295,9 +357,9 @@ def download_file(filename):
         app.logger.info(f"Попытка скачивания: {filename}")
         app.logger.info(f"Полный путь: {file_path}")
         app.logger.info(f"Файл существует: {os.path.exists(file_path)}")
-        app.logger.info(f"Файлы в директории: {os.listdir(PROCESSED_FOLDER)}")
 
         if not os.path.exists(file_path):
+            app.logger.error(f"Файлы в директории: {os.listdir(PROCESSED_FOLDER)}")
             return jsonify({'error': 'Файл не найден'}), 404
 
         if not filename.startswith('graded_'):
@@ -316,11 +378,18 @@ def health_check():
         'api_key_configured': bool(YANDEX_API_KEY),
         'models_configured': {
             f'question_{i}': bool(MODEL_URIS[i]) for i in range(1, 5)
+        },
+        'ttl_settings': {
+            'job_ttl_seconds': JOB_TTL,
+            'file_ttl_seconds': FILE_TTL
         }
     }
     return jsonify({'status': 'ok', 'config': config_status}), 200
 
 
 if __name__ == '__main__':
+    cleanup_thread = threading.Thread(target=cleanup_old_jobs, daemon=True)
+    cleanup_thread.start()
+
     port = int(os.getenv('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
